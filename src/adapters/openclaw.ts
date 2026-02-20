@@ -1,5 +1,8 @@
-import { randomUUID } from "node:crypto";
+import crypto, { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import type {
   AgentAdapter,
   AgentSession,
@@ -17,9 +20,127 @@ const PKG_VERSION: string = (
   _require("../../package.json") as { version: string }
 ).version;
 
+// --- Device identity helpers ---
+
+/** Ed25519 SPKI DER prefix (RFC 8410) — strip to get raw 32-byte public key */
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+
+export interface DeviceIdentity {
+  deviceId: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
+function base64UrlEncode(buf: Buffer): string {
+  return buf
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/g, "");
+}
+
+function derivePublicKeyRaw(publicKeyPem: string): Buffer {
+  const spki = crypto
+    .createPublicKey(publicKeyPem)
+    .export({ type: "spki", format: "der" });
+  if (
+    spki.length === ED25519_SPKI_PREFIX.length + 32 &&
+    spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)
+  ) {
+    return spki.subarray(ED25519_SPKI_PREFIX.length);
+  }
+  return spki;
+}
+
+function fingerprintPublicKey(publicKeyPem: string): string {
+  const raw = derivePublicKeyRaw(publicKeyPem);
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+function publicKeyRawBase64Url(publicKeyPem: string): string {
+  return base64UrlEncode(derivePublicKeyRaw(publicKeyPem));
+}
+
+function signPayload(privateKeyPem: string, payload: string): string {
+  const key = crypto.createPrivateKey(privateKeyPem);
+  return base64UrlEncode(
+    Buffer.from(crypto.sign(null, Buffer.from(payload, "utf8"), key)),
+  );
+}
+
+function generateDeviceIdentity(): DeviceIdentity {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey
+    .export({ type: "spki", format: "pem" })
+    .toString();
+  const privateKeyPem = privateKey
+    .export({ type: "pkcs8", format: "pem" })
+    .toString();
+  return {
+    deviceId: fingerprintPublicKey(publicKeyPem),
+    publicKeyPem,
+    privateKeyPem,
+  };
+}
+
+/** Default identity path: ~/.agentctl/identity/device.json */
+function resolveDefaultIdentityPath(): string {
+  return path.join(os.homedir(), ".agentctl", "identity", "device.json");
+}
+
+/**
+ * Load or create agentctl's device identity. Uses its own key pair
+ * (separate from OpenClaw's identity at ~/.openclaw/identity/device.json).
+ */
+export function loadOrCreateDeviceIdentity(
+  filePath: string = resolveDefaultIdentityPath(),
+): DeviceIdentity {
+  try {
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (
+        parsed?.version === 1 &&
+        typeof parsed.deviceId === "string" &&
+        typeof parsed.publicKeyPem === "string" &&
+        typeof parsed.privateKeyPem === "string"
+      ) {
+        // Re-derive deviceId from public key in case it drifted
+        const derivedId = fingerprintPublicKey(parsed.publicKeyPem);
+        return {
+          deviceId: derivedId,
+          publicKeyPem: parsed.publicKeyPem,
+          privateKeyPem: parsed.privateKeyPem,
+        };
+      }
+    }
+  } catch {
+    // Fall through to generate new identity
+  }
+
+  const identity = generateDeviceIdentity();
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const stored = {
+    version: 1,
+    deviceId: identity.deviceId,
+    publicKeyPem: identity.publicKeyPem,
+    privateKeyPem: identity.privateKeyPem,
+    createdAtMs: Date.now(),
+  };
+  fs.writeFileSync(filePath, `${JSON.stringify(stored, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  return identity;
+}
+
+// --- Connect params ---
+
 export interface OpenClawAdapterOpts {
   baseUrl?: string; // Default: http://127.0.0.1:18789
   authToken?: string; // Default: process.env.OPENCLAW_GATEWAY_TOKEN ?? process.env.OPENCLAW_WEBHOOK_TOKEN
+  /** Device identity for scoped access. Auto-created if not provided. */
+  deviceIdentity?: DeviceIdentity | null;
   /** Override for testing — replaces the real WebSocket RPC call */
   rpcCall?: RpcCallFn;
 }
@@ -78,10 +199,69 @@ export interface SessionsPreviewResult {
 }
 
 /**
- * Build the `connect` handshake params sent to the gateway after the
- * challenge event. Exported so tests can verify the protocol constants.
+ * Build the device auth payload string for signing.
+ * Format: v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce
  */
-export function buildConnectParams(authToken: string) {
+export function buildDeviceAuthPayload(params: {
+  deviceId: string;
+  clientId: string;
+  clientMode: string;
+  role: string;
+  scopes: string[];
+  signedAtMs: number;
+  token: string | null;
+  nonce: string | null;
+}): string {
+  const version = params.nonce ? "v2" : "v1";
+  const base = [
+    version,
+    params.deviceId,
+    params.clientId,
+    params.clientMode,
+    params.role,
+    params.scopes.join(","),
+    String(params.signedAtMs),
+    params.token ?? "",
+  ];
+  if (version === "v2") base.push(params.nonce ?? "");
+  return base.join("|");
+}
+
+/**
+ * Build the full `connect` handshake params sent to the gateway.
+ * Includes device auth for scoped access when identity is available.
+ * Exported so tests can verify the protocol constants.
+ */
+export function buildConnectParams(
+  authToken: string,
+  deviceIdentity?: DeviceIdentity | null,
+  nonce?: string | null,
+) {
+  const scopes = ["operator.read"];
+  const signedAtMs = Date.now();
+
+  const device = deviceIdentity
+    ? (() => {
+        const payload = buildDeviceAuthPayload({
+          deviceId: deviceIdentity.deviceId,
+          clientId: "cli",
+          clientMode: "cli",
+          role: "operator",
+          scopes,
+          signedAtMs,
+          token: authToken || null,
+          nonce: nonce ?? null,
+        });
+        return {
+          id: deviceIdentity.deviceId,
+          publicKey: publicKeyRawBase64Url(deviceIdentity.publicKeyPem),
+          signature: signPayload(deviceIdentity.privateKeyPem, payload),
+          signedAt: signedAtMs,
+          nonce: nonce ?? undefined,
+        };
+      })()
+    : undefined;
+
   return {
     minProtocol: 1,
     maxProtocol: 3,
@@ -92,8 +272,9 @@ export function buildConnectParams(authToken: string) {
       mode: "cli" as const,
     },
     role: "operator" as const,
-    scopes: ["operator.read"],
+    scopes,
     auth: { token: authToken || null },
+    device,
   };
 }
 
@@ -101,11 +282,15 @@ export function buildConnectParams(authToken: string) {
  * OpenClaw adapter — reads session data from the OpenClaw gateway via
  * its WebSocket RPC protocol. Falls back gracefully when the gateway
  * is unreachable.
+ *
+ * Uses Ed25519 device auth for scoped access (operator.read).
+ * Device identity is auto-created at ~/.agentctl/identity/device.json.
  */
 export class OpenClawAdapter implements AgentAdapter {
   readonly id = "openclaw";
   private readonly baseUrl: string;
   private readonly authToken: string;
+  private readonly deviceIdentity: DeviceIdentity | null;
   private readonly rpcCall: RpcCallFn;
 
   constructor(opts?: OpenClawAdapterOpts) {
@@ -115,7 +300,21 @@ export class OpenClawAdapter implements AgentAdapter {
       process.env.OPENCLAW_GATEWAY_TOKEN ||
       process.env.OPENCLAW_WEBHOOK_TOKEN ||
       "";
+    // Device identity: explicit null disables it (for tests), undefined = auto-create
+    this.deviceIdentity =
+      opts?.deviceIdentity === null
+        ? null
+        : (opts?.deviceIdentity ?? this.tryLoadDeviceIdentity());
     this.rpcCall = opts?.rpcCall || this.defaultRpcCall.bind(this);
+  }
+
+  private tryLoadDeviceIdentity(): DeviceIdentity | null {
+    try {
+      return loadOrCreateDeviceIdentity();
+    } catch {
+      // Don't break adapter construction if identity can't be created
+      return null;
+    }
   }
 
   async list(opts?: ListOpts): Promise<AgentSession[]> {
@@ -241,18 +440,14 @@ export class OpenClawAdapter implements AgentAdapter {
   }
 
   async resume(sessionId: string, _message: string): Promise<void> {
-    // OpenClaw sessions receive messages through their configured channels,
-    // not through a direct CLI interface.
     throw new Error(
       `Cannot resume OpenClaw session ${sessionId} — use the gateway UI or configured channel`,
     );
   }
 
   async *events(): AsyncIterable<LifecycleEvent> {
-    // Poll-based diffing (same pattern as claude-code)
     let knownSessions = new Map<string, AgentSession>();
 
-    // Initial snapshot
     const initial = await this.list({ all: true });
     for (const s of initial) {
       knownSessions.set(s.id, s);
@@ -305,10 +500,6 @@ export class OpenClawAdapter implements AgentAdapter {
 
   // --- Private helpers ---
 
-  /**
-   * Map a gateway session row to the standard AgentSession interface.
-   * OpenClaw sessions with a recent updatedAt are considered "running".
-   */
   private mapRowToSession(
     row: GatewaySessionRow,
     defaults: SessionsListResult["defaults"],
@@ -317,7 +508,6 @@ export class OpenClawAdapter implements AgentAdapter {
     const updatedAt = row.updatedAt ?? 0;
     const ageMs = now - updatedAt;
 
-    // Consider "running" if updated in the last 5 minutes
     const isActive = updatedAt > 0 && ageMs < 5 * 60 * 1000;
 
     const model = row.model || defaults.model || undefined;
@@ -344,9 +534,6 @@ export class OpenClawAdapter implements AgentAdapter {
     };
   }
 
-  /**
-   * Resolve a sessionId (or prefix) to a gateway session key.
-   */
   private async resolveKey(sessionId: string): Promise<string | null> {
     if (!this.authToken) {
       throw new Error(
@@ -377,16 +564,14 @@ export class OpenClawAdapter implements AgentAdapter {
   }
 
   /**
-   * Real WebSocket RPC call — connects, performs handshake, sends one
-   * request, reads the response, then disconnects.
+   * Real WebSocket RPC call — connects, performs handshake with device auth,
+   * sends one request, reads the response, then disconnects.
    */
   private async defaultRpcCall(
     method: string,
     params: Record<string, unknown>,
   ): Promise<unknown> {
-    // Dynamic import so tests can inject a mock without loading ws
     const { WebSocket } = await import("ws" as string).catch(() => {
-      // Fall back to globalThis.WebSocket (available in Node 22+)
       return { WebSocket: globalThis.WebSocket };
     });
 
@@ -412,14 +597,22 @@ export class OpenClawAdapter implements AgentAdapter {
             typeof event.data === "string" ? event.data : String(event.data);
           const frame = JSON.parse(raw);
 
-          // Step 1: Receive challenge, send connect
+          // Step 1: Receive challenge (with nonce), send connect with device auth
           if (frame.type === "event" && frame.event === "connect.challenge") {
+            const nonce =
+              frame.payload && typeof frame.payload.nonce === "string"
+                ? frame.payload.nonce
+                : null;
             ws.send(
               JSON.stringify({
                 type: "req",
                 id: randomUUID(),
                 method: "connect",
-                params: buildConnectParams(this.authToken),
+                params: buildConnectParams(
+                  this.authToken,
+                  this.deviceIdentity,
+                  nonce,
+                ),
               }),
             );
             return;
@@ -475,7 +668,6 @@ export class OpenClawAdapter implements AgentAdapter {
 
       ws.onclose = () => {
         clearTimeout(timeout);
-        // Only reject if we haven't resolved yet
       };
     });
   }

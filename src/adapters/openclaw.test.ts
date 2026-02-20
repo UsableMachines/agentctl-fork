@@ -1,6 +1,12 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildConnectParams,
+  buildDeviceAuthPayload,
+  loadOrCreateDeviceIdentity,
   OpenClawAdapter,
   type RpcCallFn,
   type SessionsListResult,
@@ -69,7 +75,10 @@ describe("OpenClawAdapter", () => {
   });
 
   it("has correct id", () => {
-    const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
+    const adapter = new OpenClawAdapter({
+      rpcCall: makeMockRpc({}),
+      deviceIdentity: null,
+    });
     expect(adapter.id).toBe("openclaw");
   });
 
@@ -79,6 +88,7 @@ describe("OpenClawAdapter", () => {
       const adapter = new OpenClawAdapter({
         authToken: "",
         rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
       });
       const sessions = await adapter.list();
       expect(sessions).toEqual([]);
@@ -95,6 +105,7 @@ describe("OpenClawAdapter", () => {
         rpcCall: async () => {
           throw new Error("connection refused");
         },
+        deviceIdentity: null,
       });
       const sessions = await adapter.list();
       expect(sessions).toEqual([]);
@@ -111,6 +122,7 @@ describe("OpenClawAdapter", () => {
         rpcCall: async () => {
           throw new Error("OpenClaw gateway auth failed");
         },
+        deviceIdentity: null,
       });
       const sessions = await adapter.list();
       expect(sessions).toEqual([]);
@@ -141,6 +153,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const sessions = await adapter.list({ all: true });
@@ -168,6 +181,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const sessions = await adapter.list({ all: true });
@@ -195,10 +209,9 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
-      // OpenClaw sessions are either "running" (recently active) or "idle"
-      // (quiescent). Default list includes both.
       const sessions = await adapter.list();
       expect(sessions).toHaveLength(2);
       expect(sessions[0].status).toBe("running");
@@ -225,6 +238,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const idle = await adapter.list({ status: "idle" });
@@ -249,6 +263,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const sessions = await adapter.list({ all: true });
@@ -269,6 +284,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const sessions = await adapter.list({ all: true });
@@ -304,6 +320,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const output = await adapter.peek("peek-session-id");
@@ -339,6 +356,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const output = await adapter.peek("limit-session-id", { lines: 3 });
@@ -354,6 +372,7 @@ describe("OpenClawAdapter", () => {
         rpcCall: makeMockRpc({
           "sessions.list": () => makeListResult([]),
         }),
+        deviceIdentity: null,
       });
 
       await expect(adapter.peek("nonexistent")).rejects.toThrow(
@@ -383,6 +402,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const output = await adapter.peek("abcdef12");
@@ -395,6 +415,7 @@ describe("OpenClawAdapter", () => {
       const adapter = new OpenClawAdapter({
         authToken: "",
         rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
       });
       await expect(adapter.status("some-id")).rejects.toThrow(
         "OPENCLAW_GATEWAY_TOKEN is not set",
@@ -420,6 +441,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const session = await adapter.status("status-session-id");
@@ -436,6 +458,7 @@ describe("OpenClawAdapter", () => {
         rpcCall: makeMockRpc({
           "sessions.list": () => makeListResult([]),
         }),
+        deviceIdentity: null,
       });
 
       await expect(adapter.status("nonexistent")).rejects.toThrow(
@@ -458,6 +481,7 @@ describe("OpenClawAdapter", () => {
               },
             ]),
         }),
+        deviceIdentity: null,
       });
 
       const session = await adapter.status("abcdef12");
@@ -491,14 +515,131 @@ describe("OpenClawAdapter", () => {
       expect(params.client.version).toBeTruthy();
       expect(params.client.mode).toBe("cli");
     });
+
+    it("includes device auth when identity is provided", () => {
+      const identity = {
+        deviceId: "test-device-id",
+        publicKeyPem: generateTestKeyPair().publicKeyPem,
+        privateKeyPem: generateTestKeyPair().privateKeyPem,
+      };
+      const params = buildConnectParams("tok", identity, "test-nonce");
+      expect(params.device).toBeDefined();
+      expect(params.device?.id).toBe("test-device-id");
+      expect(params.device?.publicKey).toBeTruthy();
+      expect(params.device?.signature).toBeTruthy();
+      expect(params.device?.nonce).toBe("test-nonce");
+    });
+
+    it("omits device when identity is null", () => {
+      const params = buildConnectParams("tok", null);
+      expect(params.device).toBeUndefined();
+    });
+  });
+
+  describe("buildDeviceAuthPayload()", () => {
+    it("builds v2 payload with nonce", () => {
+      const payload = buildDeviceAuthPayload({
+        deviceId: "dev123",
+        clientId: "cli",
+        clientMode: "cli",
+        role: "operator",
+        scopes: ["operator.read"],
+        signedAtMs: 1700000000000,
+        token: "tok123",
+        nonce: "nonce456",
+      });
+      expect(payload).toBe(
+        "v2|dev123|cli|cli|operator|operator.read|1700000000000|tok123|nonce456",
+      );
+    });
+
+    it("builds v1 payload without nonce", () => {
+      const payload = buildDeviceAuthPayload({
+        deviceId: "dev123",
+        clientId: "cli",
+        clientMode: "cli",
+        role: "operator",
+        scopes: ["operator.read"],
+        signedAtMs: 1700000000000,
+        token: "tok123",
+        nonce: null,
+      });
+      expect(payload).toBe(
+        "v1|dev123|cli|cli|operator|operator.read|1700000000000|tok123",
+      );
+    });
+
+    it("handles empty token", () => {
+      const payload = buildDeviceAuthPayload({
+        deviceId: "dev",
+        clientId: "cli",
+        clientMode: "cli",
+        role: "operator",
+        scopes: [],
+        signedAtMs: 0,
+        token: null,
+        nonce: null,
+      });
+      expect(payload).toBe("v1|dev|cli|cli|operator||0|");
+    });
+  });
+
+  describe("loadOrCreateDeviceIdentity()", () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentctl-test-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("creates a new identity file when none exists", () => {
+      const filePath = path.join(tmpDir, "identity", "device.json");
+      const identity = loadOrCreateDeviceIdentity(filePath);
+
+      expect(identity.deviceId).toBeTruthy();
+      expect(identity.publicKeyPem).toContain("BEGIN PUBLIC KEY");
+      expect(identity.privateKeyPem).toContain("BEGIN PRIVATE KEY");
+      expect(fs.existsSync(filePath)).toBe(true);
+
+      // File permissions should be 0o600
+      const stat = fs.statSync(filePath);
+      expect(stat.mode & 0o777).toBe(0o600);
+    });
+
+    it("loads existing identity", () => {
+      const filePath = path.join(tmpDir, "device.json");
+      const first = loadOrCreateDeviceIdentity(filePath);
+      const second = loadOrCreateDeviceIdentity(filePath);
+
+      expect(second.deviceId).toBe(first.deviceId);
+      expect(second.publicKeyPem).toBe(first.publicKeyPem);
+    });
+
+    it("deviceId is SHA-256 fingerprint of public key", () => {
+      const filePath = path.join(tmpDir, "device.json");
+      const identity = loadOrCreateDeviceIdentity(filePath);
+
+      // Derive expected fingerprint
+      const spki = crypto
+        .createPublicKey(identity.publicKeyPem)
+        .export({ type: "spki", format: "der" });
+      const raw = spki.subarray(spki.length - 32); // Ed25519 raw key is last 32 bytes
+      const expected = crypto.createHash("sha256").update(raw).digest("hex");
+      expect(identity.deviceId).toBe(expected);
+    });
   });
 
   describe("auth token resolution", () => {
     it("prefers OPENCLAW_GATEWAY_TOKEN over OPENCLAW_WEBHOOK_TOKEN", () => {
       process.env.OPENCLAW_GATEWAY_TOKEN = "gateway-token";
       process.env.OPENCLAW_WEBHOOK_TOKEN = "webhook-token";
-      const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
-      // Verify via list() — if token is set, it won't warn
+      const adapter = new OpenClawAdapter({
+        rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
+      });
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       adapter.list();
       expect(warnSpy).not.toHaveBeenCalledWith(
@@ -509,7 +650,10 @@ describe("OpenClawAdapter", () => {
 
     it("falls back to OPENCLAW_WEBHOOK_TOKEN", () => {
       process.env.OPENCLAW_WEBHOOK_TOKEN = "webhook-token";
-      const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
+      const adapter = new OpenClawAdapter({
+        rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
+      });
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       adapter.list();
       expect(warnSpy).not.toHaveBeenCalledWith(
@@ -523,6 +667,7 @@ describe("OpenClawAdapter", () => {
       const adapter = new OpenClawAdapter({
         authToken: "explicit-token",
         rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
       });
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       adapter.list();
@@ -535,24 +680,45 @@ describe("OpenClawAdapter", () => {
 
   describe("unsupported operations", () => {
     it("launch throws", async () => {
-      const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
+      const adapter = new OpenClawAdapter({
+        rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
+      });
       await expect(
         adapter.launch({ adapter: "openclaw", prompt: "test" }),
       ).rejects.toThrow("cannot be launched");
     });
 
     it("stop throws", async () => {
-      const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
+      const adapter = new OpenClawAdapter({
+        rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
+      });
       await expect(adapter.stop("some-id")).rejects.toThrow(
         "cannot be stopped",
       );
     });
 
     it("resume throws", async () => {
-      const adapter = new OpenClawAdapter({ rpcCall: makeMockRpc({}) });
+      const adapter = new OpenClawAdapter({
+        rpcCall: makeMockRpc({}),
+        deviceIdentity: null,
+      });
       await expect(adapter.resume("some-id", "msg")).rejects.toThrow(
         "Cannot resume",
       );
     });
   });
 });
+
+// --- Test helpers ---
+
+function generateTestKeyPair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  return {
+    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
+    privateKeyPem: privateKey
+      .export({ type: "pkcs8", format: "pem" })
+      .toString(),
+  };
+}
